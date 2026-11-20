@@ -184,7 +184,7 @@ def build_singbox_config(
     return json.dumps(cfg, indent=2, ensure_ascii=False)
 
 
-def build_xray_config(profile: dict, settings: dict) -> str:
+def build_xray_config(profile: dict, settings: dict, socks_only: bool = False) -> str:
     p = profile.get("params", {})
     proto = profile.get("protocol", "vless")
     resolved_ip = resolve_host_ipv4(profile["address"])
@@ -229,10 +229,14 @@ def build_xray_config(profile: dict, settings: dict) -> str:
     cfg = {
         "log": {"loglevel": "info"},
         "dns": {"servers": ["1.1.1.1", "8.8.8.8"], "queryStrategy": "UseIPv4"},
-        "inbounds": [
-            {"tag": "socks-in", "port": 10808, "listen": "127.0.0.1", "protocol": "socks", "sniffing": sniffing, "settings": {"udp": True}},
-            {"tag": "http-in", "port": 10809, "listen": "127.0.0.1", "protocol": "http", "sniffing": sniffing},
-        ],
+        "inbounds": (
+            [{"tag": "socks-in", "port": 10808, "listen": "127.0.0.1", "protocol": "socks", "sniffing": sniffing, "settings": {"udp": True}}]
+            if socks_only else
+            [
+                {"tag": "socks-in", "port": 10808, "listen": "127.0.0.1", "protocol": "socks", "sniffing": sniffing, "settings": {"udp": True}},
+                {"tag": "http-in", "port": 10809, "listen": "127.0.0.1", "protocol": "http", "sniffing": sniffing},
+            ]
+        ),
         "outbounds": [outbound, {"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
         "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"}]},
     }

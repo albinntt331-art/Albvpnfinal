@@ -110,6 +110,7 @@ class CoreProcessManager:
         self.cfg_file: Path | None = None
         self.aux_cfg_file: Path | None = None
         self.last_lines: list[str] = []
+        self.aux_lines: list[str] = []
 
     def find_binary(self, core: str) -> Path | None:
         exe = "xray.exe" if core == "xray" else "sing-box.exe"
@@ -150,6 +151,7 @@ class CoreProcessManager:
                     pass
 
         self.last_lines = []
+        self.aux_lines = []
         creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
         # Optional auxiliary Xray process (for XHTTP profiles chained behind sing-box Wintun TUN)
@@ -173,7 +175,7 @@ class CoreProcessManager:
                     errors="replace",
                     creationflags=creation_flags,
                 )
-                threading.Thread(target=self._read_logs, args=(self.aux_proc,), daemon=True).start()
+                threading.Thread(target=self._read_logs, args=(self.aux_proc, True), daemon=True).start()
                 if not self._wait_port(self.aux_proc, 10808, steps=25):
                     self.on_log(f"[ERROR] Вспомогательное ядро xray не запустилось (код {self.aux_proc.returncode}).")
                     self.stop()
@@ -207,7 +209,7 @@ class CoreProcessManager:
                 errors="replace",
                 creationflags=creation_flags,
             )
-            threading.Thread(target=self._read_logs, args=(self.proc,), daemon=True).start()
+            threading.Thread(target=self._read_logs, args=(self.proc, False), daemon=True).start()
             if not self._wait_port(self.proc, 10809, steps=30):
                 self.on_log(f"[ERROR] Ядро {core} завершилось (код {self.proc.returncode}).")
                 self.stop()
@@ -222,12 +224,15 @@ class CoreProcessManager:
             self.stop()
             return False
 
-    def _read_logs(self, proc: subprocess.Popen) -> None:
+    def _read_logs(self, proc: subprocess.Popen, is_aux: bool = False) -> None:
         if not proc or not proc.stdout:
             return
         for line in proc.stdout:
             s = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip())
-            self.last_lines = (self.last_lines + [s])[-10:]
+            if is_aux:
+                self.aux_lines = (self.aux_lines + [s])[-10:]
+            else:
+                self.last_lines = (self.last_lines + [s])[-10:]
             self.on_log(s)
 
     def stop(self) -> None:

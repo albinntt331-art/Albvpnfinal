@@ -872,7 +872,7 @@ class AlbinVpnWindow(QMainWindow):
         aux_xray_cfg = None
         if use_tun and core == "xray":
             # Chain Xray (XHTTP/splithttp) on 127.0.0.1:10808 behind sing-box gVisor Wintun TUN!
-            aux_xray_cfg = build_xray_config(sel, s)
+            aux_xray_cfg = build_xray_config(sel, s, socks_only=True)
             cfg = build_singbox_config(sel, s, use_tun=True, upstream_socks_port=10808)
             run_core = "sing-box"
             label_core = "sing-box+xray"
