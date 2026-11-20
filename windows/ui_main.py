@@ -223,11 +223,14 @@ class GlowingPowerButton(QWidget):
         p.setPen(QPen(prim, 2.4))
         p.drawEllipse(QPointF(cx, cy), core_r, core_r)
 
-        p.setPen(QPen(QColor("#FFFFFF"), 4.0, Qt.SolidLine, Qt.RoundCap))
-        p.drawArc(int(cx - 20), int(cy - 32), 40, 40, 50 * 16, 260 * 16)
-        p.drawLine(int(cx), int(cy - 38), int(cx), int(cy - 14))
-        p.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        p.drawText(int(cx - 70), int(cy + 16), 140, 32, Qt.AlignCenter, self.label_connected if self.connected else self.label_connect)
+        # Proper Power Symbol (gap at 12 o'clock: start=130 deg, span=280 deg counter-clockwise)
+        p.setPen(QPen(QColor("#FFFFFF"), 4.2 * unit, Qt.SolidLine, Qt.RoundCap))
+        ic_r = 18 * unit
+        ic_cy = cy - 12 * unit
+        p.drawArc(int(cx - ic_r), int(ic_cy - ic_r), int(ic_r * 2), int(ic_r * 2), 130 * 16, 280 * 16)
+        p.drawLine(int(cx), int(ic_cy - ic_r - 5 * unit), int(cx), int(ic_cy - 2 * unit))
+        p.setFont(QFont("Segoe UI", max(10, int(12 * unit)), QFont.Bold))
+        p.drawText(int(cx - 72 * unit), int(cy + 16 * unit), int(144 * unit), int(32 * unit), Qt.AlignCenter, self.label_connected if self.connected else self.label_connect)
 
 
 class TrafficSparklineWidget(QWidget):
@@ -865,9 +868,21 @@ class AlbinVpnWindow(QMainWindow):
             self._run_live_ping()
             QTimer.singleShot(1200, self._check_both_ips)
         else:
-            QMessageBox.warning(self, "Albin-vpn", "Core failed to start — check the Logs tab for details.")
+            tail = "\n".join(getattr(self.core_mgr, "last_lines", [])[-6:])
+            QMessageBox.warning(self, "Albin-vpn — Ошибка ядра", f"Ядро не запустилось:\n{tail}\n\nОткройте вкладку Журнал для подробностей.")
 
     def _tick_timer(self) -> None:
+        if self.connected and self.core_mgr.proc and self.core_mgr.proc.poll() is not None:
+            code = self.core_mgr.proc.returncode
+            self.core_mgr.stop()
+            self.connected = False; self.active_profile = None
+            self.power_orb.set_connected(False); self.aurora_root.set_boost(False)
+            self.status_lbl.setText(f"Ошибка ядра (код {code})")
+            self.live_ping_lbl.setText("● Ping: —"); self.exit_ip_lbl.setText("VPN: —")
+            tail = "\n".join(getattr(self.core_mgr, "last_lines", [])[-5:])
+            self._append_log(f"[WATCHDOG] Ядро остановилось (код {code}).")
+            QMessageBox.warning(self, "Albin-vpn", f"VPN-ядро остановилось (код {code}):\n{tail}")
+            return
         if self.connected and self.active_profile:
             sec = int(time.time() - self.connect_ts)
             h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60

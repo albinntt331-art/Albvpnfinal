@@ -141,10 +141,22 @@ class CoreProcessManager:
                 errors="replace",
                 creationflags=creation_flags,
             )
+            self.last_lines = []
             threading.Thread(target=self._read_logs, daemon=True).start()
-            time.sleep(0.35)
-            if self.proc.poll() is not None:
-                self.on_log(f"[ERROR] Ядро {core} завершилось с кодом {self.proc.returncode}. Проверьте права администратора для TUN.")
+            # Wait up to 2.5s for local port 10809 to actually listen & process to stay alive!
+            ready = False
+            for _ in range(25):
+                if self.proc.poll() is not None:
+                    self.on_log(f"[ERROR] Ядро {core} завершилось с кодом {self.proc.returncode}.")
+                    return False
+                try:
+                    with socket.create_connection(("127.0.0.1", 10809), timeout=0.1):
+                        ready = True
+                        break
+                except Exception:
+                    time.sleep(0.1)
+            if not ready and self.proc.poll() is not None:
+                self.on_log(f"[ERROR] Ядро {core} не смогло открыть порт 10809 (код {self.proc.returncode}).")
                 return False
             if use_system_proxy:
                 set_windows_proxy(True, "127.0.0.1:10809")
@@ -159,7 +171,10 @@ class CoreProcessManager:
         if not self.proc or not self.proc.stdout:
             return
         for line in self.proc.stdout:
-            self.on_log(line.rstrip())
+            s = line.rstrip()
+            if hasattr(self, 'last_lines'):
+                self.last_lines = (self.last_lines + [s])[-10:]
+            self.on_log(s)
 
     def stop(self) -> None:
         set_windows_proxy(False)

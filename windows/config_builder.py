@@ -1,7 +1,4 @@
-"""Albin-vpn v7 Windows Config Builder:
-- Strict TUN: sing-box 1.14 Wintun (auto_route + strict_route + IPv6 leak reject when IPv6 disabled -> 100% traffic forced into VPN!)
-- Strict Proxy Apps: sing-box 1.14 Wintun process_name split (ONLY selected apps -> VPN & rest -> direct, OR exclude selected -> direct & rest -> VPN)
-"""
+"""Albin-vpn v8 Windows Config Builder — Rock-solid sing-box 1.14 Wintun & Xray-core."""
 import json
 import socket
 
@@ -14,6 +11,10 @@ def resolve_host_ipv4(host: str) -> str:
 
 
 def choose_core(profile: dict, vpn_mode: str, is_admin: bool) -> str:
+    net = (profile.get("params", {}).get("type") or profile.get("params", {}).get("net") or "tcp").lower()
+    # Upstream sing-box does not support XHTTP/splithttp -> use Xray for XHTTP
+    if net in ("xhttp", "splithttp"):
+        return "xray"
     if is_admin:
         return "sing-box"
     if profile.get("protocol") in ("hysteria2", "wireguard", "tuic"):
@@ -33,11 +34,15 @@ def build_singbox_config(profile: dict, settings: dict, use_tun: bool = True) ->
         {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 10809}
     ]
     if use_tun:
+        # IPv4-only by default so Wintun auto_route never fails on IPv4-only Windows networks!
+        addrs = ["172.19.0.1/30"]
+        if settings.get("ipv6", False):
+            addrs.append("fdfe:dcba:9876::1/126")
         inbounds.insert(0, {
             "type": "tun",
             "tag": "tun-in",
             "interface_name": "AlbinTUN",
-            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            "address": addrs,
             "mtu": 1400,
             "auto_route": True,
             "strict_route": True,
@@ -47,6 +52,7 @@ def build_singbox_config(profile: dict, settings: dict, use_tun: bool = True) ->
     if proto == "vless":
         proxy["type"] = "vless"
         proxy["uuid"] = p.get("user", "")
+        proxy["packet_encoding"] = "xudp"
         if p.get("flow"):
             proxy["flow"] = p["flow"]
         sec = p.get("security") or p.get("tls") or "none"
@@ -88,9 +94,6 @@ def build_singbox_config(profile: dict, settings: dict, use_tun: bool = True) ->
     if not settings.get("ipv6", False):
         route_rules.append({"ip_version": 6, "action": "reject"})
 
-    # STRICT routing rules:
-    # - TUN: 100% of all Windows traffic -> proxy (zero bypass!)
-    # - Proxy Apps: strict split between selected apps and everything else
     final_out = "proxy"
     if mode == "proxy_apps" and apps:
         if policy == "only_selected":
@@ -101,11 +104,11 @@ def build_singbox_config(profile: dict, settings: dict, use_tun: bool = True) ->
             final_out = "proxy"
 
     cfg = {
-        "log": {"level": "warn", "timestamp": True},
+        "log": {"level": "info", "timestamp": True},
         "dns": {
             "servers": [
-                {"tag": "remote", "type": "https", "server": "1.1.1.1", "detour": "proxy"},
-                {"tag": "local", "type": "udp", "server": "1.1.1.1"},
+                {"tag": "remote", "type": "tcp", "server": "1.1.1.1", "detour": "proxy"},
+                {"tag": "local", "type": "local"},
             ],
             "final": "remote",
             "strategy": "ipv4_only" if not settings.get("ipv6", False) else "prefer_ipv4",
@@ -161,10 +164,14 @@ def build_xray_config(profile: dict, settings: dict) -> str:
         stream["wsSettings"] = {"path": p.get("path", "/"), "headers": {"Host": p.get("host") or profile["address"]}}
     elif net == "grpc":
         stream["grpcSettings"] = {"serviceName": p.get("serviceName", "")}
+    elif net in ("xhttp", "splithttp"):
+        stream["xhttpSettings"] = {"path": p.get("path", "/")}
+        if p.get("host"):
+            stream["xhttpSettings"]["host"] = p["host"]
     outbound["streamSettings"] = stream
 
     cfg = {
-        "log": {"loglevel": "warning"},
+        "log": {"loglevel": "info"},
         "dns": {"servers": ["1.1.1.1", "8.8.8.8"], "queryStrategy": "UseIPv4"},
         "inbounds": [
             {"tag": "socks-in", "port": 10808, "listen": "127.0.0.1", "protocol": "socks", "sniffing": sniffing, "settings": {"udp": True}},
