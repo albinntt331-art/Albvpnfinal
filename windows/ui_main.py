@@ -445,11 +445,16 @@ class AlbinVpnWindow(QMainWindow):
             self._refresh_stats()
 
     def _set_vpn_mode(self, mode: str) -> None:
+        prev = self.data["settings"].get("vpn_mode", "proxy_apps")
         self._set_setting("vpn_mode", mode)
         self.btn_mode_proxy.setProperty("active", mode == "proxy_apps")
         self.btn_mode_tun.setProperty("active", mode == "tun")
         for b in (self.btn_mode_proxy, self.btn_mode_tun):
             b.style().unpolish(b); b.style().polish(b)
+        if self.connected and mode != prev:
+            self._append_log(f"[Mode] Переключение режима на {mode} — перезапуск туннеля...")
+            self._toggle_vpn()
+            QTimer.singleShot(350, self._toggle_vpn)
 
     def _build_home_page(self) -> QWidget:
         page = QWidget(); l = QVBoxLayout(page); l.setContentsMargins(28, 22, 28, 22); l.setSpacing(16)
@@ -500,24 +505,29 @@ class AlbinVpnWindow(QMainWindow):
         il.addWidget(self.session_tot_lbl)
         right.addWidget(ip_card)
 
-        # Dual Download & Upload Sparkline Cards (identical to Android!)
-        speed_row = QHBoxLayout(); speed_row.setSpacing(14)
+        # Horizontal Download & Upload Sparkline Cards stacked one above the other
+        speed_col = QVBoxLayout(); speed_col.setSpacing(12)
+
         dl_card = QFrame(); dl_card.setProperty("class", "Card")
-        dll = QVBoxLayout(dl_card); dll.setContentsMargins(16, 14, 16, 14)
+        dll = QVBoxLayout(dl_card); dll.setContentsMargins(18, 12, 18, 12); dll.setSpacing(6)
+        dl_hdr = QHBoxLayout()
         self.dl_title_lbl = QLabel("Download"); self.dl_title_lbl.setProperty("class", "Muted")
         self.dl_val_lbl = QLabel("0 B/s")
+        dl_hdr.addWidget(self.dl_title_lbl); dl_hdr.addStretch(); dl_hdr.addWidget(self.dl_val_lbl)
         self.dl_spark = TrafficSparklineWidget(use_tertiary=False)
-        dll.addWidget(self.dl_title_lbl); dll.addWidget(self.dl_val_lbl); dll.addWidget(self.dl_spark, 1)
+        dll.addLayout(dl_hdr); dll.addWidget(self.dl_spark, 1)
 
         ul_card = QFrame(); ul_card.setProperty("class", "Card")
-        ull = QVBoxLayout(ul_card); ull.setContentsMargins(16, 14, 16, 14)
+        ull = QVBoxLayout(ul_card); ull.setContentsMargins(18, 12, 18, 12); ull.setSpacing(6)
+        ul_hdr = QHBoxLayout()
         self.ul_title_lbl = QLabel("Upload"); self.ul_title_lbl.setProperty("class", "Muted")
         self.ul_val_lbl = QLabel("0 B/s")
+        ul_hdr.addWidget(self.ul_title_lbl); ul_hdr.addStretch(); ul_hdr.addWidget(self.ul_val_lbl)
         self.ul_spark = TrafficSparklineWidget(use_tertiary=True)
-        ull.addWidget(self.ul_title_lbl); ull.addWidget(self.ul_val_lbl); ull.addWidget(self.ul_spark, 1)
+        ull.addLayout(ul_hdr); ull.addWidget(self.ul_spark, 1)
 
-        speed_row.addWidget(dl_card, 1); speed_row.addWidget(ul_card, 1)
-        right.addLayout(speed_row, 1)
+        speed_col.addWidget(dl_card, 1); speed_col.addWidget(ul_card, 1)
+        right.addLayout(speed_col, 1)
 
         mid.addLayout(right, 1)
         l.addLayout(mid, 1)
@@ -853,18 +863,38 @@ class AlbinVpnWindow(QMainWindow):
         if not sel:
             QMessageBox.information(self, "Albin-vpn", "Add a subscription or key first."); return
 
-        core = choose_core(sel, mode, self.is_admin)
-        use_tun = (mode == "tun" and self.is_admin) or (mode == "proxy_apps" and self.is_admin and core == "sing-box")
-        cfg = build_singbox_config(sel, s, use_tun=use_tun) if core == "sing-box" else build_xray_config(sel, s)
-        use_sys_proxy = not use_tun
+        if mode == "tun" and not self.is_admin and sys.platform == "win32":
+            QMessageBox.warning(self, "Albin-vpn", "Режим TUN (100% трафика) работает только с правами администратора Windows.")
+            return
 
-        if self.core_mgr.start(core, cfg, use_system_proxy=use_sys_proxy):
+        core = choose_core(sel, mode, self.is_admin)
+        use_tun = self.is_admin and (mode in ("tun", "proxy_apps"))
+        aux_xray_cfg = None
+        if use_tun and core == "xray":
+            # Chain Xray (XHTTP/splithttp) on 127.0.0.1:10808 behind sing-box gVisor Wintun TUN!
+            aux_xray_cfg = build_xray_config(sel, s)
+            cfg = build_singbox_config(sel, s, use_tun=True, upstream_socks_port=10808)
+            run_core = "sing-box"
+            label_core = "sing-box+xray"
+        elif core == "sing-box":
+            cfg = build_singbox_config(sel, s, use_tun=use_tun)
+            run_core = "sing-box"
+            label_core = "sing-box"
+        else:
+            cfg = build_xray_config(sel, s)
+            run_core = "xray"
+            label_core = "xray"
+
+        use_sys_proxy = not use_tun
+        mode_tag = "TUN" if mode == "tun" else ("Proxy Apps (Wintun)" if use_tun else "System Proxy")
+
+        if self.core_mgr.start(run_core, cfg, use_system_proxy=use_sys_proxy, aux_xray_config=aux_xray_cfg):
             self.connected = True; self.active_profile = sel; self.connect_ts = time.time()
             self.sess_rx, self.sess_tx, self.peak_rx = 0, 0, 0
             self.last_rx, self.last_tx = get_windows_net_bytes()
             self.power_orb.set_connected(True); self.aurora_root.set_boost(True)
             self.active_srv_lbl.setText(f"{'Авто → ' if sel_id == AUTO_ID else ''}{sel['name']}")
-            self.status_lbl.setText(f"{self._tr('connected')} ({'TUN' if use_tun else 'Proxy'} • {core})")
+            self.status_lbl.setText(f"{self._tr('connected')} ({mode_tag} • {label_core})")
             self._run_live_ping()
             QTimer.singleShot(1200, self._check_both_ips)
         else:

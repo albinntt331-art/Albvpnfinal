@@ -101,6 +101,11 @@ class AlbinVpnService : VpnService() {
             return
         }
 
+        // Cleanly tear down any existing tunnel before rebuilding (e.g. switching Proxy Apps <-> TUN)
+        monitorJob?.cancel(); pingJob?.cancel()
+        activeEngine?.stop(); activeEngine = null
+        runCatching { tunInterface?.close() }; tunInterface = null
+
         _state.value = ConnectionState.CONNECTING
         _stats.value = _stats.value.copy(errorMessage = null, exitIpInfo = null)
         refreshQsTile()

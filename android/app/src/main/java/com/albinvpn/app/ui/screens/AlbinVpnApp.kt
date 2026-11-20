@@ -63,7 +63,7 @@ private fun formatDuration(sec: Long): String {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AlbinVpnApp(vm: AlbinVpnViewModel, onToggleVpn: () -> Unit) {
+fun AlbinVpnApp(vm: AlbinVpnViewModel, onToggleVpn: () -> Unit, onRestartVpn: () -> Unit = {}) {
     var currentTab by remember { mutableIntStateOf(0) }
     var showStatsSheet by remember { mutableStateOf(false) }
 
@@ -173,7 +173,11 @@ fun AlbinVpnApp(vm: AlbinVpnViewModel, onToggleVpn: () -> Unit) {
                         str = str, connState = connState, stats = stats, selectedId = selectedId,
                         activeProfile = selectedProfile, settings = settings,
                         onToggleVpn = onToggleVpn, onOpenServers = { currentTab = 1 },
-                        onModeChange = { m -> vm.updateSettings { it.copy(vpnMode = m) } },
+                        onModeChange = { m ->
+                            val changed = m != settings.vpnMode
+                            vm.updateSettings { it.copy(vpnMode = m) }
+                            if (changed && isConnected) onRestartVpn()
+                        },
                         onCheckIps = vm::checkBothIps,
                         onOpenStats = { vm.refreshServerStats(); showStatsSheet = true }
                     )
@@ -490,9 +494,9 @@ fun HomeScreen(
                 Column(Modifier.weight(1.15f).fillMaxHeight().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically)) {
                     ModePillSwitcher(str, settings.vpnMode, onModeChange)
                     DualIpChainCard(str, stats, isConnected, onCheckIps, onOpenStats)
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        TrafficCard(str.download, formatRate(stats.rxBytesPerSec), stats.rxHistory, primary, Modifier.weight(1f))
-                        TrafficCard(str.upload, formatRate(stats.txBytesPerSec), stats.txHistory, tertiary, Modifier.weight(1f))
+                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        TrafficCard(str.download, formatRate(stats.rxBytesPerSec), stats.rxHistory, primary, Modifier.fillMaxWidth())
+                        TrafficCard(str.upload, formatRate(stats.txBytesPerSec), stats.txHistory, tertiary, Modifier.fillMaxWidth())
                     }
                     ActiveServerCard(str, isConnected, stats, selectedId, activeProfile, primary, tertiary, onOpenServers)
                 }
@@ -511,9 +515,9 @@ fun HomeScreen(
                     }
                 }
                 DualIpChainCard(str, stats, isConnected, onCheckIps, onOpenStats)
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    TrafficCard(str.download, formatRate(stats.rxBytesPerSec), stats.rxHistory, primary, Modifier.weight(1f))
-                    TrafficCard(str.upload, formatRate(stats.txBytesPerSec), stats.txHistory, tertiary, Modifier.weight(1f))
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    TrafficCard(str.download, formatRate(stats.rxBytesPerSec), stats.rxHistory, primary, Modifier.fillMaxWidth())
+                    TrafficCard(str.upload, formatRate(stats.txBytesPerSec), stats.txHistory, tertiary, Modifier.fillMaxWidth())
                 }
                 ActiveServerCard(str, isConnected, stats, selectedId, activeProfile, primary, tertiary, onOpenServers)
             }

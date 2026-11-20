@@ -106,7 +106,10 @@ class CoreProcessManager:
     def __init__(self, on_log):
         self.on_log = on_log
         self.proc: subprocess.Popen | None = None
+        self.aux_proc: subprocess.Popen | None = None
         self.cfg_file: Path | None = None
+        self.aux_cfg_file: Path | None = None
+        self.last_lines: list[str] = []
 
     def find_binary(self, core: str) -> Path | None:
         exe = "xray.exe" if core == "xray" else "sing-box.exe"
@@ -115,17 +118,76 @@ class CoreProcessManager:
                 return c
         return None
 
-    def start(self, core: str, config_json: str, use_system_proxy: bool = False) -> bool:
+    def _wait_port(self, proc: subprocess.Popen, port: int, steps: int = 30) -> bool:
+        for _ in range(steps):
+            if proc.poll() is not None:
+                return False
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    return True
+            except Exception:
+                time.sleep(0.1)
+        return proc.poll() is None
+
+    def start(
+        self,
+        core: str,
+        config_json: str,
+        use_system_proxy: bool = False,
+        aux_xray_config: str | None = None,
+    ) -> bool:
         self.stop()
-        if sys.platform == 'win32':
-            for proc_name in ('sing-box.exe', 'xray.exe'):
+        if sys.platform == "win32":
+            for proc_name in ("sing-box.exe", "xray.exe"):
                 try:
-                    subprocess.run(['taskkill', '/F', '/IM', proc_name, '/T'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", proc_name, "/T"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
                 except Exception:
                     pass
+
+        self.last_lines = []
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+        # Optional auxiliary Xray process (for XHTTP profiles chained behind sing-box Wintun TUN)
+        if aux_xray_config:
+            xray_bin = self.find_binary("xray")
+            if not xray_bin:
+                self.on_log("[ERROR] Не найден cores/xray.exe для XHTTP-цепочки.")
+                return False
+            fd_a, path_a = tempfile.mkstemp(prefix="albinvpn_xray_aux_", suffix=".json")
+            os.close(fd_a)
+            self.aux_cfg_file = Path(path_a)
+            self.aux_cfg_file.write_text(aux_xray_config, encoding="utf-8")
+            try:
+                self.aux_proc = subprocess.Popen(
+                    [str(xray_bin), "run", "-c", str(self.aux_cfg_file)],
+                    cwd=str(xray_bin.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=creation_flags,
+                )
+                threading.Thread(target=self._read_logs, args=(self.aux_proc,), daemon=True).start()
+                if not self._wait_port(self.aux_proc, 10808, steps=25):
+                    self.on_log(f"[ERROR] Вспомогательное ядро xray не запустилось (код {self.aux_proc.returncode}).")
+                    self.stop()
+                    return False
+                self.on_log("[xray] Локальный XHTTP-транспорт готов (127.0.0.1:10808).")
+            except Exception as exc:
+                self.on_log(f"[ERROR] Ошибка запуска xray: {exc}")
+                self.stop()
+                return False
+
         binary = self.find_binary(core)
         if not binary:
             self.on_log(f"[ERROR] Не найден cores/{'xray.exe' if core == 'xray' else 'sing-box.exe'}. Запустите download_cores.ps1")
+            self.stop()
             return False
 
         fd, path = tempfile.mkstemp(prefix=f"albinvpn_{core}_", suffix=".json")
@@ -134,9 +196,7 @@ class CoreProcessManager:
         self.cfg_file.write_text(config_json, encoding="utf-8")
 
         cmd = [str(binary), "run", "-c", str(self.cfg_file)]
-        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         try:
-            # CRITICAL: set cwd=str(binary.parent) so sing-box/xray finds wintun.dll & geoip/geosite!
             self.proc = subprocess.Popen(
                 cmd,
                 cwd=str(binary.parent),
@@ -147,22 +207,10 @@ class CoreProcessManager:
                 errors="replace",
                 creationflags=creation_flags,
             )
-            self.last_lines = []
-            threading.Thread(target=self._read_logs, daemon=True).start()
-            # Wait up to 2.5s for local port 10809 to actually listen & process to stay alive!
-            ready = False
-            for _ in range(25):
-                if self.proc.poll() is not None:
-                    self.on_log(f"[ERROR] Ядро {core} завершилось с кодом {self.proc.returncode}.")
-                    return False
-                try:
-                    with socket.create_connection(("127.0.0.1", 10809), timeout=0.1):
-                        ready = True
-                        break
-                except Exception:
-                    time.sleep(0.1)
-            if not ready and self.proc.poll() is not None:
-                self.on_log(f"[ERROR] Ядро {core} не смогло открыть порт 10809 (код {self.proc.returncode}).")
+            threading.Thread(target=self._read_logs, args=(self.proc,), daemon=True).start()
+            if not self._wait_port(self.proc, 10809, steps=30):
+                self.on_log(f"[ERROR] Ядро {core} завершилось (код {self.proc.returncode}).")
+                self.stop()
                 return False
             if use_system_proxy:
                 set_windows_proxy(True, "127.0.0.1:10809")
@@ -171,29 +219,33 @@ class CoreProcessManager:
             return True
         except Exception as exc:
             self.on_log(f"[ERROR] Ошибка запуска {core}: {exc}")
+            self.stop()
             return False
 
-    def _read_logs(self) -> None:
-        if not self.proc or not self.proc.stdout:
+    def _read_logs(self, proc: subprocess.Popen) -> None:
+        if not proc or not proc.stdout:
             return
-        for line in self.proc.stdout:
+        for line in proc.stdout:
             s = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip())
-            if hasattr(self, 'last_lines'):
-                self.last_lines = (self.last_lines + [s])[-10:]
+            self.last_lines = (self.last_lines + [s])[-10:]
             self.on_log(s)
 
     def stop(self) -> None:
         set_windows_proxy(False)
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        for p in (self.proc, self.aux_proc):
+            if p and p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
         self.proc = None
-        if self.cfg_file and self.cfg_file.exists():
-            try:
-                self.cfg_file.unlink()
-            except Exception:
-                pass
+        self.aux_proc = None
+        for f in (self.cfg_file, self.aux_cfg_file):
+            if f and f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
         self.cfg_file = None
+        self.aux_cfg_file = None

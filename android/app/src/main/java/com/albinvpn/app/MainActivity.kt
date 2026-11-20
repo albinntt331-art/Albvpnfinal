@@ -32,7 +32,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val settings by vm.settings.collectAsState()
             AlbinVpnTheme(themeMode = settings.themeMode, accentShade = settings.accentShade) {
-                AlbinVpnApp(vm = vm, onToggleVpn = { toggleVpn() })
+                AlbinVpnApp(vm = vm, onToggleVpn = { toggleVpn() }, onRestartVpn = { restartVpnIfConnected() })
             }
         }
     }
@@ -42,6 +42,14 @@ class MainActivity : ComponentActivity() {
         if (current == ConnectionState.CONNECTED || current == ConnectionState.CONNECTING) {
             startService(Intent(this, AlbinVpnService::class.java).apply { action = AlbinVpnService.ACTION_STOP })
         } else {
+            val prepareIntent = VpnService.prepare(this)
+            if (prepareIntent != null) vpnPermissionLauncher.launch(prepareIntent) else startVpnService()
+        }
+    }
+
+    private fun restartVpnIfConnected() {
+        val current = vm.connectionState.value
+        if (current == ConnectionState.CONNECTED || current == ConnectionState.CONNECTING) {
             val prepareIntent = VpnService.prepare(this)
             if (prepareIntent != null) vpnPermissionLauncher.launch(prepareIntent) else startVpnService()
         }
