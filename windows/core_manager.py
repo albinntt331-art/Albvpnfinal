@@ -117,6 +117,12 @@ class CoreProcessManager:
 
     def start(self, core: str, config_json: str, use_system_proxy: bool = False) -> bool:
         self.stop()
+        if sys.platform == 'win32':
+            for proc_name in ('sing-box.exe', 'xray.exe'):
+                try:
+                    subprocess.run(['taskkill', '/F', '/IM', proc_name, '/T'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                except Exception:
+                    pass
         binary = self.find_binary(core)
         if not binary:
             self.on_log(f"[ERROR] Не найден cores/{'xray.exe' if core == 'xray' else 'sing-box.exe'}. Запустите download_cores.ps1")
@@ -171,7 +177,7 @@ class CoreProcessManager:
         if not self.proc or not self.proc.stdout:
             return
         for line in self.proc.stdout:
-            s = line.rstrip()
+            s = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip())
             if hasattr(self, 'last_lines'):
                 self.last_lines = (self.last_lines + [s])[-10:]
             self.on_log(s)

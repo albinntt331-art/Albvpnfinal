@@ -1,6 +1,7 @@
 """Albin-vpn v8 Windows Config Builder — Rock-solid sing-box 1.14 Wintun & Xray-core."""
 import json
 import socket
+import time
 
 
 def resolve_host_ipv4(host: str) -> str:
@@ -41,7 +42,7 @@ def build_singbox_config(profile: dict, settings: dict, use_tun: bool = True) ->
         inbounds.insert(0, {
             "type": "tun",
             "tag": "tun-in",
-            "interface_name": "AlbinTUN",
+            "interface_name": f"AlbinVPN_{int(time.time()) % 100000}",
             "address": addrs,
             "mtu": 1400,
             "auto_route": True,
