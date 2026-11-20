@@ -6,22 +6,26 @@ import org.json.JSONObject
 object ConfigBuilder {
 
     /**
-     * Strict unconditional Xray-core v26+ config:
-     * - DNS uses remote DoH routed THROUGH the proxy outbound (never local ISP!)
-     * - All port 53 DNS queries hijacked into dns-out -> proxy
-     * - All TCP & UDP traffic from tun-in & socks-in forced 100% into proxy outbound
+     * Full-traffic Xray-core v26+ config with bootstrap host pinning:
+     * - Pre-resolved server IP pinned in dns.hosts so Xray never deadlocks resolving its own server domain
+     * - All port 53 DNS queries hijacked into dns-out -> proxy (zero DNS leak)
+     * - 100% of TCP & UDP traffic from tun-in & socks-in routed unconditionally through proxy
      */
-    fun buildXrayConfig(profile: VpnProfile, settings: AppSettings): String {
+    fun buildXrayConfig(profile: VpnProfile, settings: AppSettings, resolvedServerIp: String? = null): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
 
-        root.put("dns", JSONObject().apply {
+        val dnsObj = JSONObject().apply {
             put("servers", JSONArray().apply {
                 put("1.1.1.1")
                 put("8.8.8.8")
             })
             put("queryStrategy", if (settings.ipv6Enabled) "UseIP" else "UseIPv4")
-        })
+        }
+        if (!resolvedServerIp.isNullOrBlank() && resolvedServerIp != profile.address) {
+            dnsObj.put("hosts", JSONObject().put(profile.address, resolvedServerIp))
+        }
+        root.put("dns", dnsObj)
 
         val sniffing = JSONObject().apply {
             put("enabled", settings.sniffingEnabled)
@@ -52,7 +56,7 @@ object ConfigBuilder {
         root.put("inbounds", inbounds)
 
         val outbounds = JSONArray().apply {
-            put(buildXrayOutbound(profile, settings))
+            put(buildXrayOutbound(profile, settings, resolvedServerIp))
             put(JSONObject().put("tag", "dns-out").put("protocol", "dns"))
             put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
             put(JSONObject().put("tag", "block").put("protocol", "blackhole"))
@@ -70,7 +74,7 @@ object ConfigBuilder {
         }
         root.put("outbounds", outbounds)
 
-        // UNCONDITIONAL routing: DNS -> dns-out (which dials via first outbound = proxy), ALL TCP/UDP -> proxy!
+        // Unconditional full-traffic routing: DNS -> dns-out (via proxy), ALL TCP/UDP -> proxy!
         val rules = JSONArray().apply {
             put(JSONObject().apply {
                 put("type", "field")
@@ -92,8 +96,9 @@ object ConfigBuilder {
         return root.toString(2)
     }
 
-    private fun buildXrayOutbound(profile: VpnProfile, settings: AppSettings): JSONObject {
+    private fun buildXrayOutbound(profile: VpnProfile, settings: AppSettings, resolvedServerIp: String?): JSONObject {
         val p = profile.params
+        val connectHost = resolvedServerIp?.takeIf { it.isNotBlank() } ?: profile.address
         val outbound = JSONObject().put("tag", "proxy")
         when (profile.protocol.lowercase()) {
             "vless" -> {
@@ -104,19 +109,19 @@ object ConfigBuilder {
                     p["flow"]?.takeIf { it.isNotBlank() }?.let { put("flow", it) }
                 }
                 outbound.put("settings", JSONObject().put("vnext", JSONArray().put(JSONObject().apply {
-                    put("address", profile.address); put("port", profile.port); put("users", JSONArray().put(user))
+                    put("address", connectHost); put("port", profile.port); put("users", JSONArray().put(user))
                 })))
             }
             "trojan" -> {
                 outbound.put("protocol", "trojan")
                 outbound.put("settings", JSONObject().put("servers", JSONArray().put(JSONObject().apply {
-                    put("address", profile.address); put("port", profile.port); put("password", p["user"] ?: "")
+                    put("address", connectHost); put("port", profile.port); put("password", p["user"] ?: "")
                 })))
             }
             "vmess" -> {
                 outbound.put("protocol", "vmess")
                 outbound.put("settings", JSONObject().put("vnext", JSONArray().put(JSONObject().apply {
-                    put("address", profile.address); put("port", profile.port)
+                    put("address", connectHost); put("port", profile.port)
                     put("users", JSONArray().put(JSONObject().apply {
                         put("id", p["id"] ?: ""); put("security", p["scy"] ?: "auto")
                         put("alterId", p["aid"]?.toIntOrNull() ?: 0)
@@ -126,7 +131,7 @@ object ConfigBuilder {
             else -> {
                 outbound.put("protocol", "shadowsocks")
                 outbound.put("settings", JSONObject().put("servers", JSONArray().put(JSONObject().apply {
-                    put("address", profile.address); put("port", profile.port)
+                    put("address", connectHost); put("port", profile.port)
                     put("method", p["method"] ?: "aes-256-gcm"); put("password", p["password"] ?: "")
                 })))
             }
@@ -137,7 +142,7 @@ object ConfigBuilder {
         val stream = JSONObject().put("network", network).put("security", security)
         if (security == "reality") {
             stream.put("realitySettings", JSONObject().apply {
-                put("serverName", p["sni"] ?: ""); put("fingerprint", p["fp"] ?: "chrome")
+                put("serverName", p["sni"] ?: profile.address); put("fingerprint", p["fp"] ?: "chrome")
                 put("publicKey", p["pbk"] ?: ""); put("shortId", p["sid"] ?: ""); put("spiderX", p["spx"] ?: "/")
             })
         } else if (security == "tls") {
@@ -149,7 +154,7 @@ object ConfigBuilder {
         when (network) {
             "ws" -> stream.put("wsSettings", JSONObject().apply {
                 put("path", p["path"] ?: "/")
-                p["host"]?.takeIf { it.isNotBlank() }?.let { put("headers", JSONObject().put("Host", it)) }
+                put("headers", JSONObject().put("Host", p["host"]?.takeIf { it.isNotBlank() } ?: profile.address))
             })
             "grpc" -> stream.put("grpcSettings", JSONObject().apply {
                 put("serviceName", p["serviceName"] ?: p["path"] ?: "")

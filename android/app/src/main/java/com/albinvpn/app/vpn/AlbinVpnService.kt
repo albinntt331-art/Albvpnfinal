@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
@@ -34,7 +35,7 @@ class AlbinVpnService : VpnService() {
         private val _stats = MutableStateFlow(TrafficStats())
         val stats: StateFlow<TrafficStats> = _stats
 
-        private val _logs = MutableStateFlow(listOf("Albin-vpn v5 Final готов к работе."))
+        private val _logs = MutableStateFlow(listOf("Albin-vpn v7 готов к работе."))
         val logs: StateFlow<List<String>> = _logs
 
         fun appendLog(msg: String) { _logs.value = (_logs.value + msg).takeLast(250) }
@@ -85,13 +86,27 @@ class AlbinVpnService : VpnService() {
             return
         }
 
+        val settings = repo.loadSettings()
+
+        // STRICT Proxy Apps check: if ONLY_SELECTED has zero apps, warn clearly instead of silently wrapping all apps
+        if (settings.vpnMode == VpnMode.PROXY_APPS &&
+            settings.perAppPolicy == PerAppPolicy.ONLY_SELECTED &&
+            settings.selectedPackages.none { it != packageName }
+        ) {
+            val err = "Выберите хотя бы одно приложение во вкладке Приложения (или переключитесь на TUN)."
+            appendLog("[VPN ERROR] $err")
+            _stats.value = _stats.value.copy(errorMessage = err)
+            _state.value = ConnectionState.ERROR
+            refreshQsTile()
+            return
+        }
+
         _state.value = ConnectionState.CONNECTING
         _stats.value = _stats.value.copy(errorMessage = null, exitIpInfo = null)
         refreshQsTile()
         startForeground(1, buildNotification("Подключение Albin-vpn..."))
 
         scope.launch {
-            val settings = repo.loadSettings()
             val targetProfile = if (requestedId == null || requestedId == AUTO_PROFILE_ID) {
                 pickBestAutoProfile(repo, allProfiles)
             } else {
@@ -113,41 +128,44 @@ class AlbinVpnService : VpnService() {
             } else targetProfile.name
             appendLog("[Albin-vpn] Сервер: $displayName (${targetProfile.protocol.uppercase()})")
 
+            val resolvedIp = runCatching { InetAddress.getByName(targetProfile.address).hostAddress }.getOrNull()
+
             val builder = Builder()
                 .setSession("Albin-vpn")
                 .setMtu(settings.tunMtu.coerceIn(1280, 1500))
                 .addAddress("10.0.0.2", 30)
                 .addRoute("0.0.0.0", 0)
+                // Always capture IPv6 route too so dual-stack LTE/Wi-Fi never leaks outside VPN!
+                .addAddress("fd00::2", 126)
+                .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .setBlocking(false)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(false)
-            if (settings.ipv6Enabled) {
-                builder.addAddress("fd00::2", 126)
-                builder.addRoute("::", 0)
-            }
 
-            // Exclude only Albin-vpn itself so Xray outbound sockets never loop back into TUN
-            runCatching { builder.addDisallowedApplication(packageName) }
-
-            if (settings.vpnMode == VpnMode.PROXY_APPS && settings.selectedPackages.isNotEmpty()) {
+            // CRITICAL FIX: NEVER mix addDisallowedApplication() and addAllowedApplication() on the same Builder!
+            if (settings.vpnMode == VpnMode.PROXY_APPS) {
                 when (settings.perAppPolicy) {
                     PerAppPolicy.ONLY_SELECTED -> {
-                        settings.selectedPackages.filter { it != packageName }.forEach { pkg ->
+                        val allowed = settings.selectedPackages.filter { it != packageName }
+                        allowed.forEach { pkg ->
                             runCatching { builder.addAllowedApplication(pkg) }
                         }
-                        appendLog("[Mode] Proxy Apps (только выбранные: ${settings.selectedPackages.size})")
+                        appendLog("[Mode] Proxy Apps (СТРОГО только выбранные: ${allowed.size}, остальные напрямую)")
                     }
                     PerAppPolicy.EXCLUDE_SELECTED -> {
+                        runCatching { builder.addDisallowedApplication(packageName) }
                         settings.selectedPackages.forEach { pkg ->
                             runCatching { builder.addDisallowedApplication(pkg) }
                         }
-                        appendLog("[Mode] Proxy Apps (исключено: ${settings.selectedPackages.size})")
+                        appendLog("[Mode] Proxy Apps (исключено напрямую: ${settings.selectedPackages.size}, остальные в VPN)")
                     }
                 }
             } else {
-                appendLog("[Mode] TUN (Строгий — 100% трафика безоговорочно в VPN)")
+                // STRICT TUN: ONLY exclude Albin-vpn itself (prevent loop), 100% of all other traffic forced into VPN!
+                runCatching { builder.addDisallowedApplication(packageName) }
+                appendLog("[Mode] TUN (СТРОГО 100% трафика устройства в VPN)")
             }
 
             tunInterface = builder.establish()
@@ -161,7 +179,7 @@ class AlbinVpnService : VpnService() {
                 return@launch
             }
 
-            val configJson = ConfigBuilder.buildXrayConfig(targetProfile, settings)
+            val configJson = ConfigBuilder.buildXrayConfig(targetProfile, settings, resolvedIp)
             val engine = XrayCoreEngine()
             activeEngine = engine
 
@@ -179,7 +197,6 @@ class AlbinVpnService : VpnService() {
                 refreshQsTile()
                 startForeground(1, buildNotification("Защищено: $displayName"))
                 startMonitors(repo, targetProfile)
-                // Automatically fetch BOTH Direct (RF) IP and real Exit VPN IP through SOCKS5!
                 launch {
                     delay(800)
                     val directIp = repo.fetchIpInfo(viaLocalSocks = false)
@@ -218,8 +235,7 @@ class AlbinVpnService : VpnService() {
         var lastUidRx = AndroidTrafficStats.getUidRxBytes(uid).coerceAtLeast(0L)
         var lastUidTx = AndroidTrafficStats.getUidTxBytes(uid).coerceAtLeast(0L)
         var accRx = 0L; var accTx = 0L; var peakRx = 0L
-        var saveCounter = 0
-        var unsavedRx = 0L; var unsavedTx = 0L
+        var saveCounter = 0; var unsavedRx = 0L; var unsavedTx = 0L
 
         monitorJob = scope.launch {
             while (isActive && _state.value == ConnectionState.CONNECTED) {
@@ -245,11 +261,8 @@ class AlbinVpnService : VpnService() {
 
                 val cur = _stats.value
                 _stats.value = cur.copy(
-                    rxBytesPerSec = rxBps,
-                    txBytesPerSec = txBps,
-                    peakRxBytesPerSec = peakRx,
-                    totalRxBytes = accRx,
-                    totalTxBytes = accTx,
+                    rxBytesPerSec = rxBps, txBytesPerSec = txBps, peakRxBytesPerSec = peakRx,
+                    totalRxBytes = accRx, totalTxBytes = accTx,
                     rxHistory = cur.rxHistory.drop(1) + (rxBps / 1024f),
                     txHistory = cur.txHistory.drop(1) + (txBps / 1024f),
                     connectedSeconds = (System.currentTimeMillis() - startMs) / 1000L
@@ -266,7 +279,6 @@ class AlbinVpnService : VpnService() {
             }
         }
 
-        // Real end-to-end tunnel latency via local SOCKS5 proxy every 3 seconds
         pingJob = scope.launch {
             while (isActive && _state.value == ConnectionState.CONNECTED) {
                 val ms = measureTunnelPing() ?: repo.measureTcpPing(profile.address, profile.port)
@@ -285,13 +297,9 @@ class AlbinVpnService : VpnService() {
     }.getOrNull()
 
     private fun stopVpn(keepError: Boolean = false) {
-        monitorJob?.cancel()
-        pingJob?.cancel()
-        activeEngine?.stop()
-        activeEngine = null
-        activeProfile = null
-        runCatching { tunInterface?.close() }
-        tunInterface = null
+        monitorJob?.cancel(); pingJob?.cancel()
+        activeEngine?.stop(); activeEngine = null; activeProfile = null
+        runCatching { tunInterface?.close() }; tunInterface = null
         if (!keepError) {
             _state.value = ConnectionState.DISCONNECTED
             _stats.value = TrafficStats()
@@ -306,11 +314,8 @@ class AlbinVpnService : VpnService() {
             nm.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Albin-vpn", NotificationManager.IMPORTANCE_LOW))
         }
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Albin-vpn")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setOngoing(true)
-            .build()
+            .setContentTitle("Albin-vpn").setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_lock_lock).setOngoing(true).build()
     }
 
     override fun onDestroy() { stopVpn(); super.onDestroy() }
